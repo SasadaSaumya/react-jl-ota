@@ -1,0 +1,10 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "paths": {
+      "react-jl-ota": ["../src/index"],
+      "react-jl-ota/*": ["../src/*"]
+    }
+  }
+}

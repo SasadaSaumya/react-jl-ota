@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android", "web"],
+  "apple": {
+    "modules": ["ReactJlOtaModule"]
+  },
+  "android": {
+    "modules": ["com.astrivix.reactjlota.ReactJlOtaModule"]
+  }
+}
