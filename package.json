@@ -1,7 +1,7 @@
 {
   "name": "react-jl-ota",
   "version": "0.1.0",
-  "description": "jl ota update",
+  "description": "React Native / Expo OTA firmware updates for JieLi (JL) BLE chips, bridged to react-native-ble-plx",
   "main": "build/index.js",
   "types": "build/index.d.ts",
   "scripts": {
