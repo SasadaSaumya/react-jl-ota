@@ -278,14 +278,27 @@ class ReactJlOtaModule : Module(), JlOtaBridgeManager.TransportDelegate {
     }
   }
 
-  /** Download firmware to the cache dir and return the local path. */
+  /**
+   * Download firmware to the cache dir and return the local path.
+   *
+   * This blocks the OTA start on a plain HTTP fetch with no back-off/retry.
+   * Prefer downloading the firmware yourself (e.g. with a proper HTTP client
+   * that has retry/backoff) and passing `filePath` instead — this is kept as
+   * a convenience for simple cases, with generous but finite timeouts so a
+   * stalled connection fails fast instead of hanging or dying with an opaque
+   * "unexpected end of stream" after minutes of silence.
+   */
   private fun downloadFirmware(url: String): String {
     val context = appContext.reactContext
       ?: throw IllegalStateException("React context is not available")
     val dir = File(context.cacheDir, "jl_ota").apply { mkdirs() }
     val name = url.substringAfterLast('/').substringBefore('?').ifBlank { "firmware.ufw" }
     val out = File(dir, name)
-    URL(url).openStream().use { input ->
+    val connection = URL(url).openConnection().apply {
+      connectTimeout = 15_000
+      readTimeout = 30_000
+    }
+    connection.getInputStream().use { input ->
       out.outputStream().use { output -> input.copyTo(output) }
     }
     return out.absolutePath

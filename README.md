@@ -162,6 +162,16 @@ JlOta.startOta({ deviceAddress, fileBase64: '<base64 of .ufw>' });  // in-memory
 JlOta.startOta({ deviceAddress, url: 'https://cdn/app.ufw' });      // lib downloads first
 ```
 
+> **Prefer `filePath` over `url`.** The `url` convenience blocks OTA start on a
+> plain, single-attempt HTTP fetch inside the native module — on a slow or
+> flaky connection this can die with an opaque "unexpected end of stream"
+> after minutes of apparent inactivity, and there's no retry/backoff. The
+> JieLi reference Android app always downloads to a local file first (its own
+> `DownloadFileUtil`, built on OkHttp with real progress) and only then starts
+> OTA with a local path. Do the same: download with whatever HTTP client you
+> already use (e.g. `expo-file-system`'s `File.downloadFileAsync`), then call
+> `startOta({ filePath })`.
+
 ### Going faster (MTU)
 
 By default the SDK sends 20-byte packets (`mtu: 20`), which works on every device
