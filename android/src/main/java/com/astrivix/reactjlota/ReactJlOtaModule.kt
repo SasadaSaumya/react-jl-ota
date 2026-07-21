@@ -244,11 +244,21 @@ class ReactJlOtaModule : Module(), JlOtaBridgeManager.TransportDelegate {
     }
     manager.configure(config)
 
+    // Was this device already marked connected (e.g. via an earlier
+    // notifyConnectionState(true) call)? If so, don't re-signal it here —
+    // some devices auto-trigger a device-auth handshake on EVERY
+    // "connected" transition, and re-firing it right before startOTA would
+    // race it against the very first RCSP command instead of giving it the
+    // time to run to completion beforehand.
+    val alreadyConnected = bridge?.activeDevice?.address == address
+
     activeAddress = address
     otaPromise = promise
     manager.setActiveDevice(device)
-    // Mark the link as already connected (JS connected it before calling startOta).
-    manager.feedConnectionState(StateCode.CONNECTION_OK)
+    if (!alreadyConnected) {
+      // Mark the link as already connected (JS connected it before calling startOta).
+      manager.feedConnectionState(StateCode.CONNECTION_OK)
+    }
 
     manager.startOTA(upgradeCallback)
   }
