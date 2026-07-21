@@ -24,6 +24,11 @@ declare class ReactJlOtaModule extends NativeModule<ReactJlOtaModuleEvents> {
   notifyData(dataBase64: string): void;
   /** Report the BLE link going up (true) or down (false). */
   notifyConnectionState(connected: boolean): void;
+  /**
+   * Re-point the SDK at the device now at `address` (its MAC). Call after a
+   * dual-bank reconnect where the device re-advertises with a changed address.
+   */
+  setActiveDevice(address: string): void;
   isOta(): boolean;
   getDeviceInfo(): Promise<DeviceInfo | null>;
   release(): void;

@@ -1,6 +1,6 @@
 {
   "name": "react-jl-ota",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "React Native / Expo OTA firmware updates for JieLi (JL) BLE chips, bridged to react-native-ble-plx",
   "main": "build/index.js",
   "types": "build/index.d.ts",
@@ -21,14 +21,16 @@
     "react-jl-ota",
     "ReactJlOta"
   ],
-  "repository": "https://github.com/SasadaSaumya/react-jl-ota",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SasadaSaumya/react-jl-ota.git"
+  },
   "bugs": {
     "url": "https://github.com/SasadaSaumya/react-jl-ota/issues"
   },
   "author": "Sasanda Saumya <sasadasaumya@gmail.com> (https://github.com/SasadaSaumya)",
   "license": "MIT",
   "homepage": "https://github.com/SasadaSaumya/react-jl-ota#readme",
-  "dependencies": {},
   "devDependencies": {
     "@types/react": "~19.1.1",
     "expo-module-scripts": "^55.0.2",
@@ -39,5 +41,9 @@
     "expo": "*",
     "react": "*",
     "react-native": "*"
+  },
+  "directories": {
+    "doc": "docs",
+    "example": "example"
   }
 }

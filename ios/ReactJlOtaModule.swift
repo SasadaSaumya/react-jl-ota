@@ -34,6 +34,7 @@ public class ReactJlOtaModule: Module {
     Function("configure") { (_: [String: Any]) in }
     Function("notifyData") { (_: String) in }
     Function("notifyConnectionState") { (_: Bool) in }
+    Function("setActiveDevice") { (_: String) in }
     Function("isOta") { () -> Bool in false }
     Function("release") {}
 

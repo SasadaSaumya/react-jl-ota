@@ -85,6 +85,7 @@ Inbound:
 |---|---|
 | `notifyData(base64)` | `onReceiveDeviceData(activeDevice, bytes)` |
 | `notifyConnectionState(bool)` | `onBtDeviceConnection(activeDevice, CONNECTION_OK/DISCONNECT)` |
+| `setActiveDevice(address)` | `activeDevice = BluetoothAdapter.getRemoteDevice(address)` |
 
 Because `getConnectedBluetoothGatt()` is `null`, we **must** disable the SDK's MTU
 renegotiation (`setNeedChangeMtu(false)`) — otherwise it would try to call
@@ -149,10 +150,18 @@ With the JS-bridge model, your app must:
 
 1. connect to `reconnectAddress`,
 2. re-subscribe AE02,
-3. call `notifyConnectionState(true)`.
+3. call `setActiveDevice(reconnectAddress)` — **required whenever the address
+   changed**, otherwise `JlOtaBridgeManager.activeDevice` (and therefore
+   `getConnectedDevice()`) keeps returning the stale pre-reboot
+   `BluetoothDevice` even though your JS transport moved to the new one,
+4. call `notifyConnectionState(true)`.
 
 Single-bank devices never fire this. If your OTA consistently dies at the very end,
 this is almost always the cause.
+
+⚠️ Do not tear down the AE02 monitor on the *old* device by calling
+`.remove()` on it before/after reconnecting — see the crash warning in the
+README's Quick start. Let it dangle behind a `disposed`/epoch guard instead.
 
 ---
 

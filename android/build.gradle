@@ -4,13 +4,13 @@ plugins {
 }
 
 group = 'com.astrivix.reactjlota'
-version = '0.1.0'
+version = '0.1.1'
 
 android {
   namespace "com.astrivix.reactjlota"
   defaultConfig {
-    versionCode 1
-    versionName "0.1.0"
+    versionCode 2
+    versionName "0.1.1"
     // The JieLi OTA AAR ships native .so files for these ABIs only.
     ndk {
       abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'

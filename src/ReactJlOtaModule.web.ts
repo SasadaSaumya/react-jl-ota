@@ -26,6 +26,7 @@ class ReactJlOtaModule extends NativeModule<ReactJlOtaModuleEvents> {
   async cancelOta(): Promise<void> {}
   notifyData(_dataBase64: string): void {}
   notifyConnectionState(_connected: boolean): void {}
+  setActiveDevice(_address: string): void {}
   isOta(): boolean {
     return false;
   }

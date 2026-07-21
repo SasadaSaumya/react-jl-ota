@@ -85,11 +85,16 @@ const ble = new BleManager();
 export async function runOta(device: Device, filePath: string) {
   await device.discoverAllServicesAndCharacteristics();
 
+  // Guards so late/duplicate callbacks are no-ops instead of touching a torn-down
+  // monitor — see the ⚠️ note below on why we never call notifySub.remove().
+  let disposed = false;
+
   // 1) Forward every AE02 notification into the OTA engine.
   const notifySub = device.monitorCharacteristicForService(
     JlOta.JL_OTA_UUIDS.service,
     JlOta.JL_OTA_UUIDS.notify,
     (error, characteristic) => {
+      if (disposed) return;
       if (error || !characteristic?.value) return;
       JlOta.notifyData(characteristic.value); // ble-plx value is already base64
     }
@@ -97,6 +102,7 @@ export async function runOta(device: Device, filePath: string) {
 
   // 2) When the SDK wants to send bytes, write them to AE01.
   const writeSub = JlOta.onWriteRequest(async ({ dataBase64 }) => {
+    if (disposed) return;
     try {
       await device.writeCharacteristicWithoutResponseForService(
         JlOta.JL_OTA_UUIDS.service,
@@ -121,13 +127,30 @@ export async function runOta(device: Device, filePath: string) {
     });
     console.log('OTA complete', result);
   } finally {
-    notifySub.remove();
+    disposed = true;
+    // Do NOT call notifySub.remove() — see the warning below. Expo event
+    // subscriptions (write/progress) are unrelated to ble-plx and safe to remove.
     writeSub.remove();
     progressSub.remove();
     JlOta.release();
   }
 }
 ```
+
+> ⚠️ **Never call `.remove()` on a ble-plx `monitorCharacteristicForService` subscription.**
+> On `react-native-ble-plx` 3.5.0, cancelling a characteristic monitor
+> (`subscription.remove()` → native `cancelTransaction`) rejects the monitor's
+> promise with a null error code and **crashes the app natively**
+> (`NullPointerException` in `PromiseImpl.reject`) — regardless of whether the
+> device is still connected. This is not specific to OTA: it reproduces on any
+> `monitorCharacteristicForService` subscription in the host app, including
+> ones unrelated to this library, and has been observed crashing an app right
+> after an OTA failure when disconnect cleanup called `.remove()` on an
+> unrelated characteristic's monitor. Guard with a `disposed`/epoch flag as
+> shown above instead, and let the dangling native monitor get cleaned up for
+> free by `device.cancelConnection()` / `manager.destroy()`. Expo's own
+> `EventSubscription.remove()` (for `onWriteRequest`/`onProgress`/etc.) is a
+> different thing and is safe to call.
 
 ### Firmware sources
 
@@ -167,9 +190,14 @@ JlOta.onNeedReconnect(async ({ reconnectAddress }) => {
   const reconnected = await ble.connectToDevice(reconnectAddress);
   await reconnected.discoverAllServicesAndCharacteristics();
   // re-attach the AE02 monitor on the new device, then:
+  JlOta.setActiveDevice(reconnected.id); // re-point the SDK at the new device
   JlOta.notifyConnectionState(true);
 });
 ```
+
+`setActiveDevice` matters whenever `reconnectAddress` differs from the address you
+started with: without it the SDK keeps its internal `BluetoothDevice` reference
+pointed at the pre-reboot device even though your JS transport has moved on.
 
 If your firmware engineer confirmed the device **does not** change address (single
 bank), you can ignore `onOtaNeedReconnect`. Confirm the OTA mode with them — this is
@@ -188,6 +216,7 @@ the single most common source of "OTA stalls after ~95%" issues.
 | `cancelOta(): Promise<void>` | Cancel the running OTA. |
 | `notifyData(base64)` | Forward an AE02 notification into the SDK. |
 | `notifyConnectionState(connected)` | Report the BLE link up/down. |
+| `setActiveDevice(address)` | Re-point the SDK at a new MAC after a dual-bank reconnect. |
 | `isOta(): boolean` | True while an OTA is running. |
 | `getDeviceInfo(): Promise<DeviceInfo \| null>` | Cached firmware version info. |
 | `release()` | Free native resources. |
@@ -229,6 +258,8 @@ Each returns an `EventSubscription` — call `.remove()` when done.
 | Stalls near the end, then errors | Dual-bank device changed address — handle `onOtaNeedReconnect`. |
 | `Direct local .aar … not supported` at build | See [build notes](docs/JL_OTA_INTERNALS.md#packaging-the-aar). |
 | Crash on x86 emulator only | Unsupported ABI — test on arm64 or a real device. |
+| Native crash (NPE in `PromiseImpl.reject`) after/around OTA | Something called `.remove()` on a ble-plx characteristic monitor. Never do this — see the warning in [Quick start](#quick-start). |
+| `[20481] SUB_ERR_AUTH_DEVICE` immediately | Firmware rejected the auth handshake. Toggle `useAuthDevice`; if **both** true/false fail, the firmware likely needs a custom auth key this SDK can't supply — ask your firmware engineer. |
 
 Enable verbose SDK logs by checking `logcat` for the `JL_*` tags during OTA.
 

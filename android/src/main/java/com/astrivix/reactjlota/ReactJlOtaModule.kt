@@ -119,6 +119,24 @@ class ReactJlOtaModule : Module(), JlOtaBridgeManager.TransportDelegate {
       )
     }
 
+    /**
+     * Re-point the SDK at a new [BluetoothDevice] resolved from `address`.
+     * Call this after a dual-bank reconnect where the device re-advertises
+     * with a changed MAC (`onOtaNeedReconnect.reconnectAddress`) — otherwise
+     * the SDK keeps referencing the pre-reboot device internally even though
+     * JS has moved the transport to the new one.
+     */
+    Function("setActiveDevice") { address: String ->
+      val manager = ensureBridge()
+      try {
+        val device = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(address.uppercase())
+        manager.setActiveDevice(device)
+        activeAddress = address.uppercase()
+      } catch (e: Exception) {
+        // Invalid address — leave the previous active device in place.
+      }
+    }
+
     /** True while an OTA is running. */
     Function("isOta") {
       bridge?.isOTA ?: false

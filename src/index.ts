@@ -70,6 +70,16 @@ export function notifyConnectionState(connected: boolean): void {
   ReactJlOta.notifyConnectionState(connected);
 }
 
+/**
+ * Re-point the engine at the device now at `address` (its MAC). Call this
+ * after reconnecting in {@link onNeedReconnect} on dual-bank devices that
+ * re-advertise with a changed address — otherwise the SDK keeps referencing
+ * the pre-reboot device internally even though JS moved the transport.
+ */
+export function setActiveDevice(address: string): void {
+  ReactJlOta.setActiveDevice(address);
+}
+
 /** True while an OTA is running. */
 export function isOta(): boolean {
   return ReactJlOta.isOta();
