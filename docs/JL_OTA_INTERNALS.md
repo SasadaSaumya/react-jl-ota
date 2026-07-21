@@ -171,14 +171,21 @@ From `BluetoothConstant` in the AAR:
 
 ```
 UUID_SERVICE      = 0000ae00-0000-1000-8000-00805F9B34FB
-UUID_WRITE        = 0000ae01-0000-1000-8000-00805F9B34FB   (write w/o response)
+UUID_WRITE        = 0000ae01-0000-1000-8000-00805F9B34FB
 UUID_NOTIFICATION = 0000ae02-0000-1000-8000-00805F9B34FB   (notify)
 CCCD              = 00002902-0000-1000-8000-00805F9B34FB
 BLE_MTU_MIN = 20,  BLE_MTU_MAX = 509
 ```
 
 - Subscribe to **AE02** and forward every packet to `notifyData`.
-- Write SDK output to **AE01** with *write-without-response*.
+- Write SDK output to **AE01** **with response**. AE01 supports write-without-response
+  as a GATT property, but the JieLi reference Android app never opts into it
+  (`BleDevice.writeDataToDeviceByBle` never calls `setWriteType(WRITE_TYPE_NO_RESPONSE)`,
+  so it always uses Android's with-response default). Writing without response has
+  been observed to silently stall on a real device — the very first `GetTargetInfoCmd`
+  got zero replies and eventually failed with `SUB_ERR_WAITING_COMMAND_TIMEOUT` (12295),
+  with the local write reporting success the whole time. Use
+  `writeCharacteristicWithResponseForService` in ble-plx.
 - `react-native-ble-plx` exchanges characteristic values as **base64**, which lines
   up exactly with this lib's `dataBase64` in/out — no manual hex conversion needed.
 

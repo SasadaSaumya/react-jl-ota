@@ -100,11 +100,11 @@ export async function runOta(device: Device, filePath: string) {
     }
   );
 
-  // 2) When the SDK wants to send bytes, write them to AE01.
+  // 2) When the SDK wants to send bytes, write them to AE01 WITH response.
   const writeSub = JlOta.onWriteRequest(async ({ dataBase64 }) => {
     if (disposed) return;
     try {
-      await device.writeCharacteristicWithoutResponseForService(
+      await device.writeCharacteristicWithResponseForService(
         JlOta.JL_OTA_UUIDS.service,
         JlOta.JL_OTA_UUIDS.write,
         dataBase64 // base64 in, ble-plx writes the raw bytes
@@ -151,6 +151,18 @@ export async function runOta(device: Device, filePath: string) {
 > free by `device.cancelConnection()` / `manager.destroy()`. Expo's own
 > `EventSubscription.remove()` (for `onWriteRequest`/`onProgress`/etc.) is a
 > different thing and is safe to call.
+
+> ⚠️ **Write AE01 WITH response, not without.** The JieLi reference Android
+> app (`BleDevice.writeDataToDeviceByBle`) never calls
+> `characteristic.setWriteType(WRITE_TYPE_NO_RESPONSE)`, so it always writes
+> with Android's default — an ATT Write Request that the peripheral must
+> acknowledge. Writing without response instead has been observed to cause a
+> silent stall on a real device: the very first `GetTargetInfoCmd` (before
+> auth, before any firmware block) got zero replies, retried 3 times per the
+> SDK's own retry policy, then failed with `SUB_ERR_WAITING_COMMAND_TIMEOUT`
+> (12295) — with no indication anything was wrong at the BLE layer (the local
+> write "succeeded" every time). Use
+> `writeCharacteristicWithResponseForService` as shown above.
 
 ### Firmware sources
 
@@ -270,6 +282,7 @@ Each returns an `EventSubscription` — call `.remove()` when done.
 | Crash on x86 emulator only | Unsupported ABI — test on arm64 or a real device. |
 | Native crash (NPE in `PromiseImpl.reject`) after/around OTA | Something called `.remove()` on a ble-plx characteristic monitor. Never do this — see the warning in [Quick start](#quick-start). |
 | `[20481] SUB_ERR_AUTH_DEVICE` immediately | Firmware rejected the auth handshake. Toggle `useAuthDevice`; if **both** true/false fail, the firmware likely needs a custom auth key this SDK can't supply — ask your firmware engineer. |
+| `[12295] SUB_ERR_WAITING_COMMAND_TIMEOUT` on the very first command (`GetTargetInfoCmd`, before auth/any block transfer) | You're writing AE01 without response. Switch to `writeCharacteristicWithResponseForService` — see the write-type warning in [Quick start](#quick-start). |
 
 Enable verbose SDK logs by checking `logcat` for the `JL_*` tags during OTA.
 
