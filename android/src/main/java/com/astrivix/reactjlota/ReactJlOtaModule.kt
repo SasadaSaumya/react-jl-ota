@@ -10,6 +10,7 @@ import com.jieli.jl_bt_ota.constant.StateCode
 import com.jieli.jl_bt_ota.interfaces.BtEventCallback
 import com.jieli.jl_bt_ota.interfaces.IUpgradeCallback
 import com.jieli.jl_bt_ota.model.BluetoothOTAConfigure
+import com.jieli.jl_bt_ota.model.ble.BleConnectParam
 import com.jieli.jl_bt_ota.model.base.BaseError
 import com.jieli.jl_bt_ota.model.response.TargetInfoResponse
 import expo.modules.kotlin.Promise
@@ -202,6 +203,16 @@ class ReactJlOtaModule : Module(), JlOtaBridgeManager.TransportDelegate {
     isUseReconnect = false
     isUseJLServer = false
     bleScanMode = ScanSettings.SCAN_MODE_LOW_LATENCY
+    // The JieLi reference Android app (Android-JL_OTA-master, same AAR build
+    // we use: jl_bt_ota_V1.11.0_11015-release) always sets this — its
+    // BluetoothOTAConfigure is otherwise near-identical to ours, and it's the
+    // one concrete field difference found comparing our config against a
+    // config proven (via that reference app's own logcat) to authenticate
+    // successfully with this exact device. Left null (its constructor
+    // default), whether it matters at all is unverified — our bridge doesn't
+    // let the SDK own the GATT connection this param otherwise configures —
+    // but it's a free, direct match to the known-working reference.
+    bleConnectParam = BleConnectParam()
   }
 
   private fun applyConfigure(options: Map<String, Any?>) {
