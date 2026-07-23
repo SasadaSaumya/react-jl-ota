@@ -22,6 +22,14 @@ declare class ReactJlOtaModule extends NativeModule<ReactJlOtaModuleEvents> {
   cancelOta(): Promise<void>;
   /** Feed an AE02 notification (base64) into the SDK. */
   notifyData(dataBase64: string): void;
+  /**
+   * Report whether the AE01 write requested via the `onOtaWriteRequest` event
+   * actually completed. Call this as soon as your write's promise settles —
+   * the native side blocks (with a bounded timeout) waiting for this before
+   * letting the SDK proceed, so its reply-timeout clock reflects real
+   * transmission time instead of just JS bridge dispatch time.
+   */
+  notifyWriteResult(success: boolean): void;
   /** Report the BLE link going up (true) or down (false). */
   notifyConnectionState(connected: boolean): void;
   /**

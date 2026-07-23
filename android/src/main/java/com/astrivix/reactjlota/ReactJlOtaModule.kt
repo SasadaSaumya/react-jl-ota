@@ -112,6 +112,18 @@ class ReactJlOtaModule : Module(), JlOtaBridgeManager.TransportDelegate {
       bridge?.feedReceivedData(bytes)
     }
 
+    /**
+     * Report whether the AE01 write JS was just asked to perform (via
+     * `onOtaWriteRequest`) actually completed on the GATT link. Call this after
+     * your write's promise settles — success on a completed write, false on a
+     * failure or timeout. Until this is called, the native SDK call that
+     * produced the write request stays blocked (bounded, see
+     * [JlOtaBridgeManager.WRITE_ACK_TIMEOUT_MS]), so call it promptly.
+     */
+    Function("notifyWriteResult") { success: Boolean ->
+      bridge?.feedWriteResult(success)
+    }
+
     /** Tell the SDK the BLE link is up (true) or down (false). */
     Function("notifyConnectionState") { connected: Boolean ->
       bridge?.feedConnectionState(

@@ -77,13 +77,14 @@ methods onto JS:
 | `getConnectedBluetoothGatt()` | **return `null`** — JS owns the GATT; MTU changes are disabled |
 | `connectBluetoothDevice()` | emit `onOtaConnectRequest` (JS reconnects) |
 | `disconnectBluetoothDevice()` | emit `onOtaDisconnectRequest` |
-| `sendDataToDevice(d, bytes)` | emit `onOtaWriteRequest{dataBase64}`, return `true` |
+| `sendDataToDevice(d, bytes)` | emit `onOtaWriteRequest{dataBase64}`, **block (≤8s) for the real write outcome** |
 
 Inbound:
 
 | JS call | SDK call |
 |---|---|
 | `notifyData(base64)` | `onReceiveDeviceData(activeDevice, bytes)` |
+| `notifyWriteResult(success)` | unblocks the in-flight `sendDataToDevice` call, returning `success` |
 | `notifyConnectionState(bool)` | `onBtDeviceConnection(activeDevice, CONNECTION_OK/DISCONNECT)` |
 | `setActiveDevice(address)` | `activeDevice = BluetoothAdapter.getRemoteDevice(address)` |
 
@@ -93,13 +94,33 @@ renegotiation (`setNeedChangeMtu(false)`) — otherwise it would try to call
 fixed by `BluetoothOTAConfigure.mtu` (default 20, the BLE minimum), and you raise it
 explicitly after negotiating a larger MTU in `react-native-ble-plx`.
 
-### Why `sendDataToDevice` returns `true` optimistically
+### Why `sendDataToDevice` blocks for the real write result
 
-The write actually happens asynchronously in JS. We can't block the SDK thread
-waiting for ble-plx. Returning `true` lets the protocol proceed; a *real* failure
-surfaces as the device never replying, which the SDK times out on
-(`SUB_ERR_SEND_TIMEOUT` / `SUB_ERR_WAITING_COMMAND_TIMEOUT`). If you want hard
-back-pressure, write with response and disconnect on failure.
+Earlier versions of this library returned `true` from `sendDataToDevice`
+optimistically, the instant the write request was dispatched to JS, on the
+assumption that the SDK thread couldn't be blocked waiting for a JS round-trip.
+That assumption was never actually verified, and it has a real cost: the SDK
+starts its own "waiting for device reply" timeout the moment `sendDataToDevice`
+returns — so with an optimistic ack, that clock started *before* the bytes had
+even reached the JS bridge, let alone gone out over the air. On a real device
+this manifested as the very first command (`GetTargetInfoCmd`) reliably timing
+out (`SUB_ERR_SEND_TIMEOUT` 12295 / `SUB_ERR_WAITING_COMMAND_TIMEOUT` 12299)
+even with a generously bumped per-command timeout.
+
+`sendDataToDevice` now blocks (bounded to `WRITE_ACK_TIMEOUT_MS` = 8000ms,
+matching the JieLi reference Android app's own `SEND_DATA_MAX_TIMEOUT`) until
+JS calls `notifyWriteResult(success)` after the real
+`writeCharacteristicWithResponseForService` promise settles. This is safe from
+deadlock: `notifyWriteResult` is always invoked from the RN bridge thread,
+driven by ble-plx's native GATT callback — a different thread than whatever the
+SDK calls `sendDataToDevice` from — so nothing the blocked thread itself needs
+to do is required to unblock it. If a write's ack genuinely never arrives (JS
+never settles), the bound simply times out and the call reports failure, same
+as any other failed write the SDK already knows how to handle.
+
+**You must call `notifyWriteResult` from your `onWriteRequest` handler** for
+every write, on both success and failure — otherwise every write times out
+after `WRITE_ACK_TIMEOUT_MS` regardless of what actually happened on the wire.
 
 ---
 

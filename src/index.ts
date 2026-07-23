@@ -65,6 +65,18 @@ export function notifyData(dataBase64: string): void {
   ReactJlOta.notifyData(dataBase64);
 }
 
+/**
+ * Report whether the AE01 write requested via {@link onWriteRequest} actually
+ * completed. Call this as soon as your write's promise settles (success or
+ * failure) — the native side blocks the in-flight SDK call waiting for this
+ * (bounded to a few seconds), so the SDK's own reply-timeout timer starts from
+ * when the bytes were really sent, not from when the request was dispatched to
+ * JS. Skipping this call makes every write time out after that bound.
+ */
+export function notifyWriteResult(success: boolean): void {
+  ReactJlOta.notifyWriteResult(success);
+}
+
 /** Tell the engine the BLE link is up (true) or down (false). */
 export function notifyConnectionState(connected: boolean): void {
   ReactJlOta.notifyConnectionState(connected);
