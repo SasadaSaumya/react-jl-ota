@@ -1,16 +1,12 @@
 package com.astrivix.reactjlota
 
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
-import android.bluetooth.le.ScanSettings
 import android.util.Base64
-import com.jieli.jl_bt_ota.constant.BluetoothConstant
 import com.jieli.jl_bt_ota.constant.ErrorCode
 import com.jieli.jl_bt_ota.constant.StateCode
 import com.jieli.jl_bt_ota.interfaces.BtEventCallback
 import com.jieli.jl_bt_ota.interfaces.IUpgradeCallback
 import com.jieli.jl_bt_ota.model.BluetoothOTAConfigure
-import com.jieli.jl_bt_ota.model.ble.BleConnectParam
 import com.jieli.jl_bt_ota.model.base.BaseError
 import com.jieli.jl_bt_ota.model.response.TargetInfoResponse
 import expo.modules.kotlin.Promise
@@ -23,22 +19,23 @@ import java.net.URL
 /**
  * Expo native module exposing the JieLi BLE OTA flow to JavaScript.
  *
- * The module never opens a GATT connection itself. The host app keeps its
- * react-native-ble-plx connection and:
- *   1. subscribes to the AE02 notify characteristic and forwards every packet
- *      via [notifyData];
- *   2. listens for the `onOtaWriteRequest` event and writes the bytes to AE01;
- *   3. calls [startOta] once the device is connected.
+ * Unlike the library's earlier JS-bridge design, the module now owns the BLE link
+ * end to end via [JlOtaEngine] (native scan/connect/write, ported from the proven
+ * `expo-jl-ota` reference). JS just supplies a `deviceAddress` and a firmware
+ * source — no GATT plumbing required on the JS side.
  */
-class ReactJlOtaModule : Module(), JlOtaBridgeManager.TransportDelegate {
+class ReactJlOtaModule : Module() {
 
-  private var bridge: JlOtaBridgeManager? = null
+  private var engine: JlOtaEngine? = null
 
   /** Promise for the in-flight OTA, resolved on completion / rejected on error. */
   private var otaPromise: Promise? = null
 
   /** MAC address of the device currently being upgraded. */
   private var activeAddress: String? = null
+
+  /** Config tunables applied to whichever engine is current — set via [configure]. */
+  private val configOverrides = mutableMapOf<String, Any?>()
 
   private val btEventCallback = object : BtEventCallback() {
     override fun onConnection(device: BluetoothDevice?, status: Int) {
@@ -56,136 +53,86 @@ class ReactJlOtaModule : Module(), JlOtaBridgeManager.TransportDelegate {
   override fun definition() = ModuleDefinition {
     Name("ReactJlOta")
 
-    Constants(
-      // JieLi OTA GATT profile — the host app subscribes/writes these in ble-plx.
-      "SERVICE_UUID" to "0000ae00-0000-1000-8000-00805f9b34fb",
-      "WRITE_CHARACTERISTIC_UUID" to "0000ae01-0000-1000-8000-00805f9b34fb",
-      "NOTIFY_CHARACTERISTIC_UUID" to "0000ae02-0000-1000-8000-00805f9b34fb",
-      "CLIENT_CHARACTERISTIC_CONFIG_UUID" to "00002902-0000-1000-8000-00805f9b34fb",
-      "MTU_MIN" to BluetoothConstant.BLE_MTU_MIN,
-      "MTU_MAX" to BluetoothConstant.BLE_MTU_MAX
-    )
-
     Events(
-      "onOtaWriteRequest",          // { deviceAddress, dataBase64 } -> write to AE01
       "onOtaProgress",              // { deviceAddress, type, progress }
       "onOtaStateChange",           // { deviceAddress, state }
       "onOtaNeedReconnect",         // { deviceAddress, reconnectAddress, isNewWay }
-      "onOtaConnectRequest",        // { deviceAddress }
-      "onOtaDisconnectRequest",     // { deviceAddress }
       "onOtaConnectionStateChange", // { deviceAddress, status }
       "onOtaMandatoryUpgrade",      // { deviceAddress }
       "onOtaError"                  // { code, subCode, message }
     )
 
-    OnCreate {
-      ensureBridge()
-    }
-
     OnDestroy {
-      releaseBridge()
+      releaseEngine()
     }
 
     /**
-     * Configure the OTA engine. Safe to call multiple times; the latest config
-     * wins. All keys are optional.
+     * Configure the OTA engine. Safe to call multiple times, and before a device
+     * address is known — overrides are kept and applied to whichever engine is
+     * (re)created next. All keys are optional.
      */
     Function("configure") { options: Map<String, Any?> ->
-      applyConfigure(options)
+      configOverrides.putAll(options)
+      engine?.let { applyConfigure(it, options) }
     }
 
     /**
      * Start an OTA. `options` must contain `deviceAddress` and exactly one
-     * firmware source: `filePath`, `fileBase64`, or `url`.
+     * firmware source: `filePath`, `fileBase64`, or `url`. The module scans for
+     * and connects to `deviceAddress` natively — no BLE setup is required in JS.
      */
     AsyncFunction("startOta") { options: Map<String, Any?>, promise: Promise ->
       startOtaInternal(options, promise)
     }
 
     AsyncFunction("cancelOta") { promise: Promise ->
-      bridge?.cancelOTA()
+      engine?.cancelOTA()
       promise.resolve(null)
-    }
-
-    /** Push an AE02 notification (base64) received in JS into the SDK. */
-    Function("notifyData") { dataBase64: String ->
-      val bytes = Base64.decode(dataBase64, Base64.NO_WRAP)
-      bridge?.feedReceivedData(bytes)
-    }
-
-    /**
-     * Report whether the AE01 write JS was just asked to perform (via
-     * `onOtaWriteRequest`) actually completed on the GATT link. Call this after
-     * your write's promise settles — success on a completed write, false on a
-     * failure or timeout. Until this is called, the native SDK call that
-     * produced the write request stays blocked (bounded, see
-     * [JlOtaBridgeManager.WRITE_ACK_TIMEOUT_MS]), so call it promptly.
-     */
-    Function("notifyWriteResult") { success: Boolean ->
-      bridge?.feedWriteResult(success)
-    }
-
-    /** Tell the SDK the BLE link is up (true) or down (false). */
-    Function("notifyConnectionState") { connected: Boolean ->
-      bridge?.feedConnectionState(
-        if (connected) StateCode.CONNECTION_OK else StateCode.CONNECTION_DISCONNECT
-      )
-    }
-
-    /**
-     * Re-point the SDK at a new [BluetoothDevice] resolved from `address`.
-     * Call this after a dual-bank reconnect where the device re-advertises
-     * with a changed MAC (`onOtaNeedReconnect.reconnectAddress`) — otherwise
-     * the SDK keeps referencing the pre-reboot device internally even though
-     * JS has moved the transport to the new one.
-     */
-    Function("setActiveDevice") { address: String ->
-      val manager = ensureBridge()
-      try {
-        val device = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(address.uppercase())
-        manager.setActiveDevice(device)
-        activeAddress = address.uppercase()
-      } catch (e: Exception) {
-        // Invalid address — leave the previous active device in place.
-      }
     }
 
     /** True while an OTA is running. */
     Function("isOta") {
-      bridge?.isOTA ?: false
+      engine?.isOTA ?: false
     }
 
     /** Read cached device info (firmware version, etc.) for the active device. */
     AsyncFunction("getDeviceInfo") { promise: Promise ->
-      val info = bridge?.deviceInfo
+      val info = engine?.deviceInfo
       promise.resolve(info?.let { targetInfoToMap(it) })
     }
 
     Function("release") {
-      releaseBridge()
+      releaseEngine()
     }
   }
 
-  // region Bridge lifecycle
+  // region Engine lifecycle
 
-  private fun ensureBridge(): JlOtaBridgeManager {
-    bridge?.let { return it }
-    val context = appContext.reactContext
-      ?: throw CodedException("ERR_NO_CONTEXT", "React context is not available", null)
-    val manager = JlOtaBridgeManager(context.applicationContext, this)
-    manager.registerBluetoothCallback(btEventCallback)
-    // Sensible defaults; overridden by configure().
-    manager.configure(defaultConfigure())
-    bridge = manager
-    return manager
-  }
-
-  private fun releaseBridge() {
-    bridge?.let {
+  /** Returns the engine for [address], recreating it if it currently targets a different device. */
+  private fun ensureEngine(address: String): JlOtaEngine {
+    val current = engine
+    if (current != null && current.mac.equals(address, ignoreCase = true)) {
+      return current
+    }
+    current?.let {
       it.unregisterBluetoothCallback(btEventCallback)
       it.release()
     }
-    bridge = null
+    val context = appContext.reactContext
+      ?: throw CodedException("ERR_NO_CONTEXT", "React context is not available", null)
+    val created = JlOtaEngine(context.applicationContext, address)
+    created.registerBluetoothCallback(btEventCallback)
+    applyConfigure(created, configOverrides)
+    engine = created
+    return created
+  }
+
+  private fun releaseEngine() {
+    engine?.let {
+      it.unregisterBluetoothCallback(btEventCallback)
+      it.release()
+    }
+    engine = null
     otaPromise = null
     activeAddress = null
   }
@@ -196,28 +143,19 @@ class ReactJlOtaModule : Module(), JlOtaBridgeManager.TransportDelegate {
 
   private fun defaultConfigure(): BluetoothOTAConfigure = BluetoothOTAConfigure.createDefault().apply {
     priority = BluetoothOTAConfigure.PREFER_BLE
-    // JS owns the link; the SDK must not try to renegotiate the MTU.
+    isUseAuthDevice = true
+    bleIntervalMs = 500
+    timeoutMs = 3000
+    mtu = 500
+    // BleManager already renegotiates the real GATT MTU right after connecting
+    // (see its onDescriptorWrite -> startChangeMtu); the SDK doing it again would
+    // be redundant. Matches the reference's own proven config exactly.
     isNeedChangeMtu = false
-    mtu = BluetoothConstant.BLE_MTU_MIN
-    // The SDK does not auto-reconnect; JS handles reconnection during OTA.
-    isUseReconnect = false
-    isUseJLServer = false
-    bleScanMode = ScanSettings.SCAN_MODE_LOW_LATENCY
-    // The JieLi reference Android app (Android-JL_OTA-master, same AAR build
-    // we use: jl_bt_ota_V1.11.0_11015-release) always sets this — its
-    // BluetoothOTAConfigure is otherwise near-identical to ours, and it's the
-    // one concrete field difference found comparing our config against a
-    // config proven (via that reference app's own logcat) to authenticate
-    // successfully with this exact device. Left null (its constructor
-    // default), whether it matters at all is unverified — our bridge doesn't
-    // let the SDK own the GATT connection this param otherwise configures —
-    // but it's a free, direct match to the known-working reference.
-    bleConnectParam = BleConnectParam()
+    isUseReconnect = true
   }
 
-  private fun applyConfigure(options: Map<String, Any?>) {
-    val manager = ensureBridge()
-    val config = manager.bluetoothOption ?: defaultConfigure()
+  private fun applyConfigure(target: JlOtaEngine, options: Map<String, Any?>) {
+    val config = target.bluetoothOption ?: defaultConfigure()
     (options["useSpp"] as? Boolean)?.let {
       config.priority = if (it) BluetoothOTAConfigure.PREFER_SPP else BluetoothOTAConfigure.PREFER_BLE
     }
@@ -226,7 +164,7 @@ class ReactJlOtaModule : Module(), JlOtaBridgeManager.TransportDelegate {
     intOf(options["mtu"])?.let { config.mtu = it }
     intOf(options["timeoutMs"])?.let { config.timeoutMs = it }
     intOf(options["bleIntervalMs"])?.let { config.bleIntervalMs = it }
-    manager.configure(config)
+    target.configure(config)
   }
 
   // endregion
@@ -234,52 +172,56 @@ class ReactJlOtaModule : Module(), JlOtaBridgeManager.TransportDelegate {
   // region OTA
 
   private fun startOtaInternal(options: Map<String, Any?>, promise: Promise) {
-    val manager = ensureBridge()
-
-    if (manager.isOTA) {
-      promise.reject(CodedException("ERR_OTA_IN_PROGRESS", "An OTA is already running", null))
-      return
-    }
-
     val address = (options["deviceAddress"] as? String)?.uppercase()
     if (address.isNullOrBlank()) {
       promise.reject(CodedException("ERR_BAD_ADDRESS", "deviceAddress is required", null))
       return
     }
 
-    val device: BluetoothDevice = try {
-      BluetoothAdapter.getDefaultAdapter().getRemoteDevice(address)
-    } catch (e: Exception) {
-      promise.reject(CodedException("ERR_BAD_ADDRESS", "Invalid deviceAddress: $address", e))
+    val engine = try {
+      ensureEngine(address)
+    } catch (e: CodedException) {
+      promise.reject(e)
       return
     }
 
-    // Per-call config overrides (mtu/auth/...).
-    applyConfigure(options)
-    val config = manager.bluetoothOption ?: defaultConfigure()
+    if (engine.isOTA) {
+      promise.reject(CodedException("ERR_OTA_IN_PROGRESS", "An OTA is already running", null))
+      return
+    }
 
-    // Resolve the firmware source.
+    // Per-call config overrides (mtu/auth/...), then resolve the firmware source.
+    applyConfigure(engine, options)
+    val config = engine.bluetoothOption ?: defaultConfigure()
     try {
       resolveFirmware(options, config)
     } catch (e: Exception) {
       promise.reject(CodedException("ERR_FIRMWARE", e.message ?: "Failed to load firmware", e))
       return
     }
-    manager.configure(config)
+    engine.configure(config)
 
     activeAddress = address
     otaPromise = promise
-    manager.setActiveDevice(device)
-    // Always (re-)confirm the link is up right before starting, even if JS
-    // already called notifyConnectionState(true) earlier (e.g. to give a
-    // device-triggered auth handshake time to run during firmware download).
-    // A prior attempt at skipping this "redundant" call when already marked
-    // connected caused startOTA() to run against connection state that was
-    // by then tens of seconds stale, failing with 4114
-    // (SUB_ERR_REMOTE_NOT_CONNECTED) even though the link was still live.
-    manager.feedConnectionState(StateCode.CONNECTION_OK)
 
-    manager.startOTA(upgradeCallback)
+    var otaStarted = false
+    if (engine.isConnected()) {
+      // Reused engine already connected from a previous call to the same address.
+      otaStarted = true
+      engine.startOTA(upgradeCallback)
+    } else {
+      lateinit var connectGate: BtEventCallback
+      connectGate = object : BtEventCallback() {
+        override fun onConnection(device: BluetoothDevice?, status: Int) {
+          if (status == StateCode.CONNECTION_OK && !otaStarted) {
+            otaStarted = true
+            engine.unregisterBluetoothCallback(connectGate)
+            engine.startOTA(upgradeCallback)
+          }
+        }
+      }
+      engine.registerBluetoothCallback(connectGate)
+    }
   }
 
   /** Populate `firmwareFilePath` / `firmwareFileData` on the config. */
@@ -348,6 +290,9 @@ class ReactJlOtaModule : Module(), JlOtaBridgeManager.TransportDelegate {
         )
       )
       sendState("reconnect")
+      // Native reconnect — scan for the (possibly changed, dual-bank) address and
+      // reconnect without any JS involvement.
+      engine?.reConnect(addr, isNewReconnectWay)
     }
 
     override fun onProgress(type: Int, progress: Float) {
@@ -386,31 +331,6 @@ class ReactJlOtaModule : Module(), JlOtaBridgeManager.TransportDelegate {
 
   private fun sendState(state: String) {
     sendEvent("onOtaStateChange", mapOf("deviceAddress" to activeAddress, "state" to state))
-  }
-
-  // endregion
-
-  // region TransportDelegate (called by JlOtaBridgeManager on SDK threads)
-
-  override fun onWriteRequest(deviceAddress: String?, data: ByteArray): Boolean {
-    sendEvent(
-      "onOtaWriteRequest",
-      mapOf(
-        "deviceAddress" to (deviceAddress ?: activeAddress),
-        "dataBase64" to Base64.encodeToString(data, Base64.NO_WRAP)
-      )
-    )
-    // We optimistically report success; JS reports real write failures by
-    // disconnecting / not feeding a response, which the SDK times out on.
-    return true
-  }
-
-  override fun onConnectRequest(deviceAddress: String?) {
-    sendEvent("onOtaConnectRequest", mapOf("deviceAddress" to (deviceAddress ?: activeAddress)))
-  }
-
-  override fun onDisconnectRequest(deviceAddress: String?) {
-    sendEvent("onOtaDisconnectRequest", mapOf("deviceAddress" to (deviceAddress ?: activeAddress)))
   }
 
   // endregion

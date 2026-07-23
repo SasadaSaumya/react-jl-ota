@@ -3,11 +3,12 @@
 React Native / Expo OTA firmware-update library for **JieLi (杰理 / JL)** Bluetooth
 chips, wrapping the official `jl_bt_ota` Android SDK.
 
-It is built for apps that **already manage their own BLE connection with
-[`react-native-ble-plx`](https://github.com/dotintent/react-native-ble-plx)**.
-The native module runs only the JieLi OTA (RCSP) protocol; **your JS keeps owning
-the BLE link**. No second GATT connection, no duplicate scanning, no conflict with
-your existing device-controller app.
+The module **owns the BLE link end to end, natively** — scanning, connecting, GATT
+writes, notification handling, MTU negotiation, and dual-bank reconnect all happen
+inside the native module. Your JS just supplies a device address (however you
+obtained it — your own scan, a paired-devices list, etc.) and a firmware source.
+No `react-native-ble-plx` wiring, no GATT plumbing, no `notifyData`/write-request
+event handling required.
 
 > Platform support: **Android only.** The JieLi OTA SDK is an Android `.aar`.
 > The library is importable on iOS/web but every OTA call rejects with
@@ -17,30 +18,21 @@ your existing device-controller app.
 
 ## How it works
 
-The JieLi `BluetoothOTAManager` is an *abstract transport* — it implements the OTA
-protocol but delegates the actual reading/writing of bytes. This library plugs that
-transport into your `react-native-ble-plx` connection:
+The JieLi `BluetoothOTAManager` is an *abstract transport* — it implements the RCSP/OTA
+protocol but delegates the actual reading/writing of bytes to whoever embeds it. This
+library implements that transport with its own native BLE engine (`JlOtaEngine` +
+`ble/BleManager`, ported from JieLi's own proven reference Android integration):
 
 ```
- JS (your app, react-native-ble-plx)          Native (react-jl-ota + JL SDK)
- ────────────────────────────────────         ──────────────────────────────
- scan + connect the device          ─────────▶  (already connected)
- subscribe to AE02 notify char
- onOtaWriteRequest  ◀───────────────────────── SDK wants to send bytes
-   → write bytes to AE01
- AE02 notification ──── notifyData() ────────▶  SDK parses device reply
- startOta({ deviceAddress, … })     ─────────▶  BluetoothOTAManager.startOTA()
- onOtaProgress / resolve(startOta)  ◀───────── IUpgradeCallback
+ JS (your app)                          Native (react-jl-ota)
+ ─────────────                          ──────────────────────
+ startOta({ deviceAddress, … }) ──────▶  scan for deviceAddress
+                                         connect GATT, discover services
+                                         enable AE02 notifications, negotiate MTU
+                                         BluetoothOTAManager.startOTA()
+ onOtaProgress / resolve(startOta) ◀────  IUpgradeCallback
+ onOtaNeedReconnect (informational) ◀──  native reconnect already in progress
 ```
-
-**JieLi OTA GATT profile** (exported as `JL_OTA_UUIDS`):
-
-| Role        | UUID                                   |
-|-------------|----------------------------------------|
-| Service     | `0000ae00-0000-1000-8000-00805f9b34fb` |
-| Write (AE01)| `0000ae01-0000-1000-8000-00805f9b34fb` |
-| Notify(AE02)| `0000ae02-0000-1000-8000-00805f9b34fb` |
-| CCCD        | `00002902-0000-1000-8000-00805f9b34fb` |
 
 For a deeper explanation of the SDK internals, the RCSP protocol, dual-bank
 reconnection and error codes, see [`docs/JL_OTA_INTERNALS.md`](docs/JL_OTA_INTERNALS.md).
@@ -55,13 +47,13 @@ This is a local Expo module that bundles the vendor AAR. The AAR is already in
 In your app:
 
 ```bash
-npm install react-jl-ota react-native-ble-plx
+npm install react-jl-ota
 npx expo prebuild   # config plugin / autolinking picks up the native module
 ```
 
-`react-native-ble-plx` requires a custom dev client (it does not run in Expo Go).
-Add its config plugin in `app.json` and request the BLE runtime permissions
-(`BLUETOOTH_SCAN`, `BLUETOOTH_CONNECT`, and location on Android < 12).
+The module requests its own BLE runtime permissions declaration
+(`BLUETOOTH_SCAN`, `BLUETOOTH_CONNECT`, and location on Android < 12) — your app
+still needs to *request* these at runtime before calling `startOta`.
 
 > **Min Android SDK 21.** The vendor AAR ships native `.so` files for
 > `armeabi-v7a`, `arm64-v8a`, `x86`, `x86_64` only.
@@ -71,98 +63,30 @@ Add its config plugin in `app.json` and request the BLE runtime permissions
 ## Quick start
 
 ```ts
-import { Buffer } from 'buffer';
-import { BleManager, Device } from 'react-native-ble-plx';
 import * as JlOta from 'react-jl-ota';
 
-const ble = new BleManager();
+const progressSub = JlOta.onProgress(({ type, progress }) =>
+  console.log(`OTA phase ${type}: ${progress.toFixed(1)}%`)
+);
+const errorSub = JlOta.onError(({ subCode, message }) =>
+  console.warn(`OTA error [${subCode}] ${message}`)
+);
 
-/**
- * Run an OTA on an already-connected ble-plx Device.
- * @param device  a connected react-native-ble-plx Device
- * @param filePath absolute path to the .ufw firmware file on disk
- */
-export async function runOta(device: Device, filePath: string) {
-  await device.discoverAllServicesAndCharacteristics();
-
-  // Guards so late/duplicate callbacks are no-ops instead of touching a torn-down
-  // monitor — see the ⚠️ note below on why we never call notifySub.remove().
-  let disposed = false;
-
-  // 1) Forward every AE02 notification into the OTA engine.
-  const notifySub = device.monitorCharacteristicForService(
-    JlOta.JL_OTA_UUIDS.service,
-    JlOta.JL_OTA_UUIDS.notify,
-    (error, characteristic) => {
-      if (disposed) return;
-      if (error || !characteristic?.value) return;
-      JlOta.notifyData(characteristic.value); // ble-plx value is already base64
-    }
-  );
-
-  // 2) When the SDK wants to send bytes, write them to AE01 WITH response.
-  const writeSub = JlOta.onWriteRequest(async ({ dataBase64 }) => {
-    if (disposed) return;
-    try {
-      await device.writeCharacteristicWithResponseForService(
-        JlOta.JL_OTA_UUIDS.service,
-        JlOta.JL_OTA_UUIDS.write,
-        dataBase64 // base64 in, ble-plx writes the raw bytes
-      );
-    } catch (e) {
-      console.warn('AE01 write failed', e);
-    }
+try {
+  const result = await JlOta.startOta({
+    deviceAddress: 'A1:B2:C3:D4:E5:F6', // the device's MAC
+    filePath: '/data/.../app.ufw',
   });
-
-  // 3) Progress + lifecycle.
-  const progressSub = JlOta.onProgress(({ type, progress }) =>
-    console.log(`OTA phase ${type}: ${progress.toFixed(1)}%`)
-  );
-
-  try {
-    const result = await JlOta.startOta({
-      deviceAddress: device.id,        // on Android, Device.id is the MAC
-      filePath,
-      mtu: 20,                         // bump after negotiating a larger MTU (see below)
-    });
-    console.log('OTA complete', result);
-  } finally {
-    disposed = true;
-    // Do NOT call notifySub.remove() — see the warning below. Expo event
-    // subscriptions (write/progress) are unrelated to ble-plx and safe to remove.
-    writeSub.remove();
-    progressSub.remove();
-    JlOta.release();
-  }
+  console.log('OTA complete', result);
+} finally {
+  progressSub.remove();
+  errorSub.remove();
+  JlOta.release();
 }
 ```
 
-> ⚠️ **Never call `.remove()` on a ble-plx `monitorCharacteristicForService` subscription.**
-> On `react-native-ble-plx` 3.5.0, cancelling a characteristic monitor
-> (`subscription.remove()` → native `cancelTransaction`) rejects the monitor's
-> promise with a null error code and **crashes the app natively**
-> (`NullPointerException` in `PromiseImpl.reject`) — regardless of whether the
-> device is still connected. This is not specific to OTA: it reproduces on any
-> `monitorCharacteristicForService` subscription in the host app, including
-> ones unrelated to this library, and has been observed crashing an app right
-> after an OTA failure when disconnect cleanup called `.remove()` on an
-> unrelated characteristic's monitor. Guard with a `disposed`/epoch flag as
-> shown above instead, and let the dangling native monitor get cleaned up for
-> free by `device.cancelConnection()` / `manager.destroy()`. Expo's own
-> `EventSubscription.remove()` (for `onWriteRequest`/`onProgress`/etc.) is a
-> different thing and is safe to call.
-
-> ⚠️ **Write AE01 WITH response, not without.** The JieLi reference Android
-> app (`BleDevice.writeDataToDeviceByBle`) never calls
-> `characteristic.setWriteType(WRITE_TYPE_NO_RESPONSE)`, so it always writes
-> with Android's default — an ATT Write Request that the peripheral must
-> acknowledge. Writing without response instead has been observed to cause a
-> silent stall on a real device: the very first `GetTargetInfoCmd` (before
-> auth, before any firmware block) got zero replies, retried 3 times per the
-> SDK's own retry policy, then failed with `SUB_ERR_WAITING_COMMAND_TIMEOUT`
-> (12295) — with no indication anything was wrong at the BLE layer (the local
-> write "succeeded" every time). Use
-> `writeCharacteristicWithResponseForService` as shown above.
+That's it — no scanning, connecting, or characteristic wiring needed; the module
+does all of that natively once `startOta` is called.
 
 ### Firmware sources
 
@@ -184,46 +108,18 @@ JlOta.startOta({ deviceAddress, url: 'https://cdn/app.ufw' });      // lib downl
 > already use (e.g. `expo-file-system`'s `File.downloadFileAsync`), then call
 > `startOta({ filePath })`.
 
-### Going faster (MTU)
-
-By default the SDK sends 20-byte packets (`mtu: 20`), which works on every device
-but is slow. To speed up:
-
-```ts
-const negotiated = await device.requestMTU(247); // ble-plx
-await JlOta.startOta({
-  deviceAddress: device.id,
-  filePath,
-  mtu: negotiated.mtu - 3, // never exceed (MTU − 3)
-});
-```
-
 ---
 
 ## Dual-bank devices & reconnection
 
 Some JieLi devices reboot into a loader and **re-advertise with a changed MAC
-address** mid-OTA. When that happens the SDK emits `onOtaNeedReconnect` with the
-new address; your JS must reconnect to it and tell the engine:
-
-```ts
-JlOta.onNeedReconnect(async ({ reconnectAddress }) => {
-  if (!reconnectAddress) return;
-  const reconnected = await ble.connectToDevice(reconnectAddress);
-  await reconnected.discoverAllServicesAndCharacteristics();
-  // re-attach the AE02 monitor on the new device, then:
-  JlOta.setActiveDevice(reconnected.id); // re-point the SDK at the new device
-  JlOta.notifyConnectionState(true);
-});
-```
-
-`setActiveDevice` matters whenever `reconnectAddress` differs from the address you
-started with: without it the SDK keeps its internal `BluetoothDevice` reference
-pointed at the pre-reboot device even though your JS transport has moved on.
+address** mid-OTA. The native engine handles this itself: on `IUpgradeCallback.onNeedReconnect`
+it scans for and reconnects to the new address using the ported `ReConnectHelper`,
+without any JS involvement. `onOtaNeedReconnect` is emitted purely for visibility
+(e.g. updating a "reconnecting…" UI state) — you don't need to act on it.
 
 If your firmware engineer confirmed the device **does not** change address (single
-bank), you can ignore `onOtaNeedReconnect`. Confirm the OTA mode with them — this is
-the single most common source of "OTA stalls after ~95%" issues.
+bank), this event simply never fires.
 
 ---
 
@@ -233,41 +129,32 @@ the single most common source of "OTA stalls after ~95%" issues.
 
 | Function | Description |
 |---|---|
-| `configure(options)` | Set engine options (see below). Optional. |
-| `startOta(options): Promise<OtaResult>` | Start OTA; resolves on success, rejects on error/cancel. |
+| `configure(options)` | Set engine options (see below). Optional; can be called before a device address is known. |
+| `startOta(options): Promise<OtaResult>` | Scan for, connect to, and upgrade `options.deviceAddress`. Resolves on success, rejects on error/cancel. |
 | `cancelOta(): Promise<void>` | Cancel the running OTA. |
-| `notifyData(base64)` | Forward an AE02 notification into the SDK. |
-| `notifyConnectionState(connected)` | Report the BLE link up/down. |
-| `setActiveDevice(address)` | Re-point the SDK at a new MAC after a dual-bank reconnect. |
 | `isOta(): boolean` | True while an OTA is running. |
 | `getDeviceInfo(): Promise<DeviceInfo \| null>` | Cached firmware version info. |
-| `release()` | Free native resources. |
+| `release()` | Disconnect and free native resources. |
 
 ### `configure` / `startOta` options
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `deviceAddress` | `string` | — | **Required for `startOta`.** Device MAC. |
+| `deviceAddress` | `string` | — | **Required for `startOta`.** Device MAC; the module scans for and connects to it. |
 | `filePath` / `fileBase64` / `url` | `string` | — | Firmware source (pick one). |
-| `mtu` | `number` | `20` | Bytes per write; ≤ negotiated MTU − 3. |
+| `mtu` | `number` | `500` | Requested MTU; the native engine negotiates the real GATT MTU itself. |
 | `useSpp` | `boolean` | `false` | Use classic SPP instead of BLE. |
-| `useAuthDevice` | `boolean` | `false` | Device authentication (ask firmware eng.). |
-| `useReconnect` | `boolean` | `false` | Let the SDK manage reconnect (advanced). |
-| `timeoutMs` | `number` | SDK default | Command timeout. |
-| `bleIntervalMs` | `number` | SDK default | Connection-interval hint. |
+| `useAuthDevice` | `boolean` | `true` | Device authentication (ask firmware eng. if OTA fails at the auth step). |
+| `useReconnect` | `boolean` | `true` | SDK reconnect awareness (native reconnect always runs regardless). |
+| `timeoutMs` | `number` | `3000` | Command timeout. |
+| `bleIntervalMs` | `number` | `500` | Connection-interval hint. |
 
 ### Event subscriptions
 
 Each returns an `EventSubscription` — call `.remove()` when done.
 
-`onWriteRequest`, `onProgress`, `onStateChange`, `onNeedReconnect`,
-`onConnectRequest`, `onDisconnectRequest`, `onConnectionStateChange`,
+`onProgress`, `onStateChange`, `onNeedReconnect`, `onConnectionStateChange`,
 `onMandatoryUpgrade`, `onError`.
-
-### Constants
-
-`JL_OTA_UUIDS` `{ service, write, notify, clientConfig }`, `JL_MTU_MIN` (20),
-`JL_MTU_MAX` (509).
 
 ---
 
@@ -275,14 +162,13 @@ Each returns an `EventSubscription` — call `.remove()` when done.
 
 | Symptom | Likely cause |
 |---|---|
-| `ERR_BAD_ADDRESS` | `deviceAddress` is not a valid MAC. Use `device.id` on Android. |
-| OTA never starts / times out | AE02 monitor not attached, or `onOtaWriteRequest` not writing to AE01. |
-| Stalls near the end, then errors | Dual-bank device changed address — handle `onOtaNeedReconnect`. |
+| `ERR_BAD_ADDRESS` | `deviceAddress` is not a valid MAC. |
+| `ERR_NO_CONTEXT` | Called before the module's React context was ready (very rare). |
+| OTA never starts / times out | Runtime BLE permissions (`BLUETOOTH_SCAN`/`BLUETOOTH_CONNECT`, plus location on Android < 12) not granted, or the device isn't advertising. |
+| Stalls near the end, then errors | Dual-bank reconnect failed — check `onOtaNeedReconnect`/`onOtaError` logs; usually a scan/connect issue on the new address. |
 | `Direct local .aar … not supported` at build | See [build notes](docs/JL_OTA_INTERNALS.md#packaging-the-aar). |
 | Crash on x86 emulator only | Unsupported ABI — test on arm64 or a real device. |
-| Native crash (NPE in `PromiseImpl.reject`) after/around OTA | Something called `.remove()` on a ble-plx characteristic monitor. Never do this — see the warning in [Quick start](#quick-start). |
 | `[20481] SUB_ERR_AUTH_DEVICE` immediately | Firmware rejected the auth handshake. Toggle `useAuthDevice`; if **both** true/false fail, the firmware likely needs a custom auth key this SDK can't supply — ask your firmware engineer. |
-| `[12295] SUB_ERR_WAITING_COMMAND_TIMEOUT` on the very first command (`GetTargetInfoCmd`, before auth/any block transfer) | You're writing AE01 without response. Switch to `writeCharacteristicWithResponseForService` — see the write-type warning in [Quick start](#quick-start). |
 
 Enable verbose SDK logs by checking `logcat` for the `JL_*` tags during OTA.
 

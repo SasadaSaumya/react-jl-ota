@@ -1,28 +1,25 @@
 /**
  * Public types for react-jl-ota.
  *
- * The library wraps the JieLi (杰理) `jl_bt_ota` Android SDK and drives the OTA
- * (RCSP) protocol natively, while the BLE transport stays in your JavaScript
- * react-native-ble-plx code. See README.md for the wiring.
+ * The library wraps the JieLi (杰理) `jl_bt_ota` Android SDK and owns the BLE link
+ * end to end natively — scanning, connecting, and writing all happen inside the
+ * native module. You just supply a device address (however you obtained it) and a
+ * firmware source; no GATT plumbing is required in JavaScript.
  */
 
 /** Tunable options for the OTA engine. All fields optional. */
 export type ReactJlOtaConfig = {
   /** Use SPP (classic BT) instead of BLE. Default: false (BLE). */
   useSpp?: boolean;
-  /** Enable device authentication. Confirm with your firmware engineer. Default: false. */
+  /** Enable device authentication. Confirm with your firmware engineer. Default: true. */
   useAuthDevice?: boolean;
-  /** Let the SDK manage reconnection. Default: false (JS handles reconnect). */
+  /** Let the SDK manage reconnection awareness. Default: true. */
   useReconnect?: boolean;
-  /**
-   * Max bytes per BLE write the SDK produces. Must be <= (negotiated MTU − 3).
-   * Default: 20 (always safe). Raise it (e.g. to the value you negotiated with
-   * ble-plx) for faster transfers.
-   */
+  /** Max bytes per BLE write the SDK produces. Default: 500. */
   mtu?: number;
-  /** Command timeout in ms. Default comes from the SDK. */
+  /** Command timeout in ms. Default: 3000. */
   timeoutMs?: number;
-  /** BLE connection interval hint in ms. */
+  /** BLE connection interval hint in ms. Default: 500. */
   bleIntervalMs?: number;
 };
 
@@ -35,7 +32,7 @@ export type FirmwareSource =
 /** Options for {@link startOta}. */
 export type StartOtaOptions = ReactJlOtaConfig &
   FirmwareSource & {
-    /** MAC address of the already-connected device, e.g. "A1:B2:C3:D4:E5:F6". */
+    /** MAC address of the target device, e.g. "A1:B2:C3:D4:E5:F6". The module scans for and connects to it natively. */
     deviceAddress: string;
   };
 
@@ -59,13 +56,6 @@ export type OtaState = 'start' | 'reconnect' | 'stop' | 'cancel';
 
 // ---- Event payloads ----
 
-/** Emitted when the SDK needs bytes written to the AE01 characteristic. */
-export type OtaWriteRequestPayload = {
-  deviceAddress: string | null;
-  /** Base64-encoded bytes to write to AE01 (write-without-response). */
-  dataBase64: string;
-};
-
 export type OtaProgressPayload = {
   deviceAddress: string | null;
   /** Phase indicator from the SDK (firmware-dependent). */
@@ -81,7 +71,7 @@ export type OtaStateChangePayload = {
 
 export type OtaNeedReconnectPayload = {
   deviceAddress: string | null;
-  /** Address the device will advertise with after rebooting into the loader. */
+  /** Address the device advertises with after rebooting into the loader (native reconnect already in progress). */
   reconnectAddress: string | null;
   isNewWay: boolean;
 };
@@ -103,12 +93,9 @@ export type OtaErrorPayload = {
 };
 
 export type ReactJlOtaModuleEvents = {
-  onOtaWriteRequest: (payload: OtaWriteRequestPayload) => void;
   onOtaProgress: (payload: OtaProgressPayload) => void;
   onOtaStateChange: (payload: OtaStateChangePayload) => void;
   onOtaNeedReconnect: (payload: OtaNeedReconnectPayload) => void;
-  onOtaConnectRequest: (payload: OtaSimpleDevicePayload) => void;
-  onOtaDisconnectRequest: (payload: OtaSimpleDevicePayload) => void;
   onOtaConnectionStateChange: (payload: OtaConnectionStatePayload) => void;
   onOtaMandatoryUpgrade: (payload: OtaSimpleDevicePayload) => void;
   onOtaError: (payload: OtaErrorPayload) => void;

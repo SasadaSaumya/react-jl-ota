@@ -5,10 +5,8 @@ import * as JlOta from 'react-jl-ota';
 /**
  * Minimal demo of the react-jl-ota API surface.
  *
- * NOTE: a real OTA also needs a live react-native-ble-plx connection with the
- * AE02 notify characteristic forwarded into JlOta.notifyData() and the
- * onOtaWriteRequest event writing to AE01. See the README "Quick start" for the
- * full ble-plx wiring — this screen only demonstrates the OTA-engine side.
+ * The module owns the BLE link natively (scan/connect/write) — just supply a
+ * device address and a firmware source. No BLE wiring is needed in JS.
  */
 export default function App() {
   const [progress, setProgress] = useState(0);
@@ -19,10 +17,6 @@ export default function App() {
     const subs = [
       JlOta.onProgress(({ progress }) => setProgress(progress)),
       JlOta.onStateChange(({ state }) => setState(state)),
-      JlOta.onWriteRequest(({ dataBase64 }) => {
-        // In a real app: write dataBase64 to AE01 via react-native-ble-plx here.
-        console.log('AE01 write request', dataBase64.length, 'b64 chars');
-      }),
       JlOta.onError(({ subCode, message }) => setError(`[${subCode}] ${message}`)),
     ];
     return () => subs.forEach((s) => s.remove());
@@ -32,13 +26,6 @@ export default function App() {
     <SafeAreaView style={styles.container}>
       <ScrollView style={styles.container}>
         <Text style={styles.header}>react-jl-ota</Text>
-
-        <Group name="GATT profile (for ble-plx)">
-          <Text>service: {JlOta.JL_OTA_UUIDS.service}</Text>
-          <Text>write:   {JlOta.JL_OTA_UUIDS.write}</Text>
-          <Text>notify:  {JlOta.JL_OTA_UUIDS.notify}</Text>
-          <Text>mtu: {JlOta.JL_MTU_MIN}–{JlOta.JL_MTU_MAX}</Text>
-        </Group>
 
         <Group name="State">
           <Text>state: {state}</Text>

@@ -1,15 +1,19 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
   <!--
-    The OTA protocol runs natively but the BLE transport is driven by the host
-    app (react-native-ble-plx). These permissions let the SDK resolve a
-    BluetoothDevice from its MAC address. The host app is expected to already
-    request the runtime BLE permissions for scanning/connecting.
+    The library owns the BLE link natively: scanning, GATT connect, and writes
+    all happen inside this module (see JlOtaEngine / ble/BleManager). These
+    permissions are load-bearing, not vestigial — BLUETOOTH_SCAN/CONNECT are
+    required on Android 12+, and ACCESS_FINE_LOCATION/ACCESS_COARSE_LOCATION are
+    required by the OS for BLE scanning on Android <12 (BleManager.startLeScan
+    checks for it before scanning).
   -->
   <uses-permission android:name="android.permission.BLUETOOTH" />
   <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
   <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
   <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+  <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+  <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
   <!-- Required for the optional remote-URL firmware download. -->
   <uses-permission android:name="android.permission.INTERNET" />
 

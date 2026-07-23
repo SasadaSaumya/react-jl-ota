@@ -9,7 +9,10 @@ Sources studied:
 - Official repo & demo app: <https://gitee.com/Jieli-Tech/Android-JL_OTA>
 - SDK AAR: `jl_bt_ota_V1.11.0_11015-release.aar` (SDK version 1.11.0, build 11015)
 - JL framework docs: <https://doc.zh-jieli.com/Apps/Android/ota/en-us/master/>
-- The demo's reference integration class `OTAManager.kt` + `OTAViewModel.kt`
+- A second, independently built integration (`expo-jl-ota`) that owns BLE natively
+  end to end and is proven reliable in production — this library's native BLE
+  engine (`JlOtaEngine`, `ble/BleManager`, `ble/ReConnectHelper`, etc.) is a
+  faithful Kotlin port of that integration's Java code.
 
 ---
 
@@ -47,101 +50,68 @@ void onMtuChanged(BluetoothGatt gatt, int mtu, int status);    // MTU negotiated
 void onError(BaseError error);
 ```
 
-This is exactly the **"external library / 外接库"** integration path in the JL docs.
-It is *the* reason this React Native library can exist without re-implementing BLE:
-we let your existing `react-native-ble-plx` connection be the transport.
+**This library owns BLE natively** and implements all five methods against a real
+`android.bluetooth.BluetoothGatt` connection it manages itself (`JlOtaEngine` +
+`ble/BleManager`) — there is no JS-side GATT involvement. This is the same
+integration shape as the JieLi reference demo app, not the "external transport"
+path — the difference from the demo is packaging (an Expo/RN native module) and a
+few naming/API choices, not the underlying BLE logic, which is a direct, faithful
+port.
 
-### Two ways to integrate (and why we chose one)
-
-| | Native-owned BLE | **JS-bridge transport (this lib)** |
-|---|---|---|
-| Who scans/connects | the SDK's `BleManager` | your `react-native-ble-plx` code |
-| GATT connections | a 2nd one (conflicts) | reuse the one you already have |
-| Matches JL demo | yes (copy `BleManager`) | uses the documented external-lib path |
-| App changes | hand off the device | wire 2 callbacks (write + notify) |
-
-Android allows **one GATT connection per device**. An app that already controls the
-device over `react-native-ble-plx` cannot have the SDK open a second one cleanly.
-So we bridge the transport to JS.
+> **History note:** an earlier version of this library instead delegated the five
+> transport methods to JavaScript, so a host app's existing
+> `react-native-ble-plx` connection could act as the transport (avoiding a second
+> GATT connection to the same device). That design is no longer used — the native
+> BLE engine here is a proven, from-scratch Bluetooth stack (scan, connect,
+> service discovery, notification enable, MTU negotiation, write queue, dual-bank
+> reconnect) that does not require or interact with any BLE connection the host
+> app might separately hold.
 
 ---
 
-## 2. The bridge, concretely
+## 2. The native BLE engine, concretely
 
-`JlOtaBridgeManager.kt` subclasses `BluetoothOTAManager` and maps the five transport
-methods onto JS:
+Three cooperating pieces, all under `android/src/main/java/com/astrivix/reactjlota/`:
 
-| SDK call | What we do |
+| Class | Role |
 |---|---|
-| `getConnectedDevice()` | return a `BluetoothDevice` resolved from the MAC JS passed to `startOta` |
-| `getConnectedBluetoothGatt()` | **return `null`** — JS owns the GATT; MTU changes are disabled |
-| `connectBluetoothDevice()` | emit `onOtaConnectRequest` (JS reconnects) |
-| `disconnectBluetoothDevice()` | emit `onOtaDisconnectRequest` |
-| `sendDataToDevice(d, bytes)` | emit `onOtaWriteRequest{dataBase64}`, **block (≤8s) for the real write outcome** |
+| `JlOtaEngine` (extends `BluetoothOTAManager`) | Implements the 5 transport methods against `BleManager`; bridges `BleManager`'s connection/notification/MTU events into the SDK's `onBtDeviceConnection`/`onReceiveDeviceData`/`onMtuChanged`. |
+| `ble/BleManager` | Owns the actual `BluetoothGatt`: LE scan (filtering for the target MAC), `connectGatt`, service discovery, enabling the AE02 notification descriptor, MTU negotiation, and a serialized write queue (`SendBleDataThread`) with retry. |
+| `ble/ReConnectHelper` | Dual-bank reconnect: on `onNeedReconnect`, scans for the (possibly new) address and reconnects, entirely in native code. |
 
-Inbound:
+`ReactJlOtaModule` creates a `JlOtaEngine` per target `deviceAddress` (recreating it
+if `startOta` is called with a different address — mirrors the reference's
+"recreate manager when the mac changes" behavior), waits for the engine's own
+`BtEventCallback.onConnection(status = CONNECTION_OK)` before calling
+`startOTA(IUpgradeCallback)`, and forwards `onNeedReconnect` straight into
+`JlOtaEngine.reConnect(address, isNewWay)`.
 
-| JS call | SDK call |
-|---|---|
-| `notifyData(base64)` | `onReceiveDeviceData(activeDevice, bytes)` |
-| `notifyWriteResult(success)` | unblocks the in-flight `sendDataToDevice` call, returning `success` |
-| `notifyConnectionState(bool)` | `onBtDeviceConnection(activeDevice, CONNECTION_OK/DISCONNECT)` |
-| `setActiveDevice(address)` | `activeDevice = BluetoothAdapter.getRemoteDevice(address)` |
-
-Because `getConnectedBluetoothGatt()` is `null`, we **must** disable the SDK's MTU
-renegotiation (`setNeedChangeMtu(false)`) — otherwise it would try to call
-`gatt.requestMtu(...)` on a null GATT. The per-packet payload size is therefore
-fixed by `BluetoothOTAConfigure.mtu` (default 20, the BLE minimum), and you raise it
-explicitly after negotiating a larger MTU in `react-native-ble-plx`.
-
-### Why `sendDataToDevice` blocks for the real write result
-
-Earlier versions of this library returned `true` from `sendDataToDevice`
-optimistically, the instant the write request was dispatched to JS, on the
-assumption that the SDK thread couldn't be blocked waiting for a JS round-trip.
-That assumption was never actually verified, and it has a real cost: the SDK
-starts its own "waiting for device reply" timeout the moment `sendDataToDevice`
-returns — so with an optimistic ack, that clock started *before* the bytes had
-even reached the JS bridge, let alone gone out over the air. On a real device
-this manifested as the very first command (`GetTargetInfoCmd`) reliably timing
-out (`SUB_ERR_SEND_TIMEOUT` 12295 / `SUB_ERR_WAITING_COMMAND_TIMEOUT` 12299)
-even with a generously bumped per-command timeout.
-
-`sendDataToDevice` now blocks (bounded to `WRITE_ACK_TIMEOUT_MS` = 8000ms,
-matching the JieLi reference Android app's own `SEND_DATA_MAX_TIMEOUT`) until
-JS calls `notifyWriteResult(success)` after the real
-`writeCharacteristicWithResponseForService` promise settles. This is safe from
-deadlock: `notifyWriteResult` is always invoked from the RN bridge thread,
-driven by ble-plx's native GATT callback — a different thread than whatever the
-SDK calls `sendDataToDevice` from — so nothing the blocked thread itself needs
-to do is required to unblock it. If a write's ack genuinely never arrives (JS
-never settles), the bound simply times out and the call reports failure, same
-as any other failed write the SDK already knows how to handle.
-
-**You must call `notifyWriteResult` from your `onWriteRequest` handler** for
-every write, on both success and failure — otherwise every write times out
-after `WRITE_ACK_TIMEOUT_MS` regardless of what actually happened on the wire.
+Because `getConnectedBluetoothGatt()` now returns a **real** GATT (unlike the old
+JS-bridge design, which returned `null` to disable this), MTU renegotiation is
+live: `BleManager` requests it unconditionally right after enabling notifications,
+independent of `BluetoothOTAConfigure.isNeedChangeMtu` — which this library still
+sets to `false` so the SDK itself doesn't *also* attempt `gatt.requestMtu(...)` and
+race with `BleManager`'s own negotiation.
 
 ---
 
 ## 3. Configuration (`BluetoothOTAConfigure`)
 
-Built from the demo's reference config. Fields this lib sets / exposes:
+Built from the proven reference's own config. Fields this lib sets / exposes:
 
 | Field | Default here | Meaning |
 |---|---|---|
 | `priority` | `PREFER_BLE` | BLE vs SPP transport (`useSpp` flips it) |
-| `isNeedChangeMtu` | `false` | **must stay false** (null GATT) |
-| `mtu` | `20` | bytes per write packet (`MTU_MIN`=20 … `MTU_MAX`=509) |
-| `isUseReconnect` | `false` | SDK-managed reconnect; we let JS do it |
-| `isUseAuthDevice` | `false` | device authentication handshake — **ask your firmware engineer** |
-| `isUseJLServer` | `false` | JieLi cloud features (unused) |
-| `bleScanMode` | `LOW_LATENCY` | only relevant if SDK scans (it doesn't here) |
-| `timeoutMs`, `bleIntervalMs` | SDK default | tunables |
+| `isNeedChangeMtu` | `false` | `BleManager` already renegotiates MTU itself; avoids a redundant/racing SDK-driven attempt |
+| `mtu` | `500` | requested MTU; real negotiated value comes back through `BleManager`'s `onMtuChanged` path |
+| `isUseReconnect` | `true` | SDK reconnect awareness — native reconnect via `ReConnectHelper` always runs on `onNeedReconnect` regardless |
+| `isUseAuthDevice` | `true` | device authentication handshake — **ask your firmware engineer** if OTA fails at the auth step |
+| `bleIntervalMs` | `500` | connection-interval hint |
+| `timeoutMs` | `3000` | command timeout |
 
-`isUseAuthDevice` matters: if the firmware requires authentication and you leave it
-`false`, OTA fails early; if it does **not** and you set `true`, it also fails. This
-is a firmware-side decision — confirm it.
+`isUseAuthDevice` matters: if the firmware requires authentication and you set it
+`false`, OTA fails early with `SUB_ERR_AUTH_DEVICE`; if it does **not** require auth
+and you set `true`, it also fails. This is a firmware-side decision — confirm it.
 
 ---
 
@@ -154,7 +124,7 @@ and the `startOta` promise:
 |---|---|---|
 | `onStartOTA()` | `onOtaStateChange{state:'start'}` | — |
 | `onProgress(type, %)` | `onOtaProgress{type, progress}` | — |
-| `onNeedReconnect(addr, newWay)` | `onOtaNeedReconnect` + `state:'reconnect'` | — |
+| `onNeedReconnect(addr, newWay)` | `onOtaNeedReconnect` + `state:'reconnect'` | native reconnect kicked off via `JlOtaEngine.reConnect` |
 | `onStopOTA()` | `state:'stop'` | **resolve** |
 | `onCancelOTA()` | `state:'cancel'` | **reject** `ERR_OTA_CANCELLED` |
 | `onError(BaseError)` | `onOtaError{code,subCode,message}` | **reject** `ERR_OTA_FAILED` |
@@ -165,24 +135,13 @@ verify); treat the `progress` float (0–100) as the user-facing number.
 ### `onNeedReconnect` — dual-bank / address change
 
 Many JieLi OTA designs are **dual-bank**: the device writes the new firmware to a
-spare bank, reboots into a loader, and **re-advertises with MAC address + 1** (the
-demo literally does `addr[last] + 1`). The SDK signals this via `onNeedReconnect`.
-With the JS-bridge model, your app must:
+spare bank, reboots into a loader, and **re-advertises with a changed MAC** (often
+MAC + 1). The SDK signals this via `onNeedReconnect`, and `ReConnectHelper` (ported
+from the proven reference) handles it entirely natively: it scans for the new
+address (or the same address if not using a new-ADV scheme), reconnects, and lets
+the SDK resume once the link is back up — no JS action required.
 
-1. connect to `reconnectAddress`,
-2. re-subscribe AE02,
-3. call `setActiveDevice(reconnectAddress)` — **required whenever the address
-   changed**, otherwise `JlOtaBridgeManager.activeDevice` (and therefore
-   `getConnectedDevice()`) keeps returning the stale pre-reboot
-   `BluetoothDevice` even though your JS transport moved to the new one,
-4. call `notifyConnectionState(true)`.
-
-Single-bank devices never fire this. If your OTA consistently dies at the very end,
-this is almost always the cause.
-
-⚠️ Do not tear down the AE02 monitor on the *old* device by calling
-`.remove()` on it before/after reconnecting — see the crash warning in the
-README's Quick start. Let it dangle behind a `disposed`/epoch guard instead.
+Single-bank devices never fire this.
 
 ---
 
@@ -198,20 +157,12 @@ CCCD              = 00002902-0000-1000-8000-00805F9B34FB
 BLE_MTU_MIN = 20,  BLE_MTU_MAX = 509
 ```
 
-- Subscribe to **AE02** and forward every packet to `notifyData`.
-- Write SDK output to **AE01** **with response**. AE01 supports write-without-response
-  as a GATT property, but the JieLi reference Android app never opts into it
-  (`BleDevice.writeDataToDeviceByBle` never calls `setWriteType(WRITE_TYPE_NO_RESPONSE)`,
-  so it always uses Android's with-response default). Writing without response has
-  been observed to silently stall on a real device — the very first `GetTargetInfoCmd`
-  got zero replies and eventually failed with `SUB_ERR_WAITING_COMMAND_TIMEOUT` (12295),
-  with the local write reporting success the whole time. Use
-  `writeCharacteristicWithResponseForService` in ble-plx.
-- `react-native-ble-plx` exchanges characteristic values as **base64**, which lines
-  up exactly with this lib's `dataBase64` in/out — no manual hex conversion needed.
+`BleManager` subscribes to AE02, writes SDK output to AE01, and enables the CCCD
+descriptor itself — none of this is exposed to JS anymore, since there's no JS-side
+GATT to wire it into.
 
-RCSP packets are length-prefixed and reassembled inside the SDK, so you forward raw
-notification payloads as-is; do not try to parse or merge them yourself.
+RCSP packets are length-prefixed and reassembled inside the SDK; `BleManager`
+forwards raw notification payloads as-is.
 
 ---
 
@@ -270,7 +221,7 @@ depend on it by coordinate.
 There is **no JieLi OTA SDK for iOS** in this package — `jl_bt_ota` is Android-only.
 The iOS module is a stub: it exposes the same JS surface but rejects OTA calls with
 `ERR_UNSUPPORTED_PLATFORM`. Supporting iOS would require JieLi's iOS OTA SDK and a
-parallel `BluetoothOTAManager`-equivalent bridge.
+parallel `BluetoothOTAManager`-equivalent native BLE engine.
 
 ---
 
@@ -281,7 +232,8 @@ parallel `BluetoothOTAManager`-equivalent bridge.
 cd example/android && ./gradlew :react-jl-ota:compileDebugKotlin
 ```
 
-A full end-to-end test needs a real JieLi device and a valid `.ufw` file. The
-`react-native-ble-plx` connection must be live, AE02 subscribed, and the
-`onOtaWriteRequest` handler wired before calling `startOta`.
-```
+A full end-to-end test needs a real JieLi device and a valid `.ufw` file. Grant the
+runtime BLE permissions (`BLUETOOTH_SCAN`/`BLUETOOTH_CONNECT`, plus location on
+Android < 12) in the host app before calling `startOta` — the native scan silently
+no-ops without them (see `tool/AppUtil.checkHasScanPermission` /
+`isHasLocationPermission`).
